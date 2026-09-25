@@ -27,10 +27,10 @@ def compute_pairwise_features(df_pairs, s1_features, s23_features):
     c_addrs = df_pairs['c_id'].map(s23_features['address_basic']).fillna('').values
     
     print("Computing RapidFuzz string distances...")
-    name_jaro = [fuzz.jaro_winkler(s1, c) / 100.0 for s1, c in zip(s1_names, c_names)]
+    name_jaro = [fuzz.partial_ratio(s1, c) / 100.0 for s1, c in zip(s1_names, c_names)]
     name_ratio = [fuzz.ratio(s1, c) / 100.0 for s1, c in zip(s1_names, c_names)]
     
-    addr_jaro = [fuzz.jaro_winkler(s1, c) / 100.0 for s1, c in zip(s1_addrs, c_addrs)]
+    addr_jaro = [fuzz.partial_ratio(s1, c) / 100.0 for s1, c in zip(s1_addrs, c_addrs)]
     addr_ratio = [fuzz.ratio(s1, c) / 100.0 for s1, c in zip(s1_addrs, c_addrs)]
     
     print("Computing Jaccard similarities...")
