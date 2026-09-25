@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Data and large files
+DATA/
+artifacts/
+experiments/
+output/
+*.zip
+*.npy
+*.pkl
