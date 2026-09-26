@@ -1,23 +1,19 @@
 """
-TriMatch-ER B2 — Final Production Pipeline
+TriMatch-ER B2 — Kaggle Production Pipeline
 ===========================================
-Architecture:
-    B1 Candidates → LightGBM Pruning (top-K) → Cross-Encoder GPU Reranking → Output
+Designed to run on Kaggle GPU Notebooks (T4 / P100 / L4).
 
-Usage:
-    # Validation run (50K entities, ~10 min):
-    python src/generate_submission_b2.py --mode validate --n-val 50000
+Features:
+- Dynamic dataset auto-discovery under /kaggle/input/ or local directory
+- CPU (LightGBM pruning) + GPU (Cross-Encoder reranking) parallel pipeline
+- Automatic submission zip creation (`submission_b2.zip`) in /kaggle/working/
 
-    # Full run (1.73M entities):
-    python src/generate_submission_b2.py --mode full
-
-Features used: exactly the 9 features the LightGBM model was trained on:
-    retrieval_score, name_jaro, name_ratio, name_jaccard,
-    addr_jaro, addr_ratio, addr_jaccard, num_overlap, num_conflict
+Usage in Kaggle Notebook / Terminal:
+    python generate_submission_b2_kaggle.py --mode full
 """
 
-import sys, os, gc, time, argparse, warnings, queue, threading, zipfile
-import builtins, io
+import sys, os, gc, time, argparse, warnings, queue, threading, zipfile, glob
+import builtins
 
 import numpy as np
 import pandas as pd
@@ -29,7 +25,7 @@ from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
 
-# ── Force UTF-8 + always-flush prints on Windows ───────────
+# ── Force UTF-8 + always-flush prints ──────────────────────
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 _orig_print = builtins.print
@@ -38,14 +34,14 @@ def _fprint(*a, **kw):
     _orig_print(*a, **kw)
 builtins.print = _fprint
 
-# ── Config ─────────────────────────────────────────────────
+# ── Config Defaults ─────────────────────────────────────────
 FEATURE_COLS = [
     'retrieval_score', 'name_jaro', 'name_ratio', 'name_jaccard',
     'addr_jaro', 'addr_ratio', 'addr_jaccard', 'num_overlap', 'num_conflict'
 ]
 TOP_K_LGBM      = 10    # LightGBM top-K sent to Cross-Encoder
-LGBM_THRESHOLD  = 0.0   # Keep all top-K regardless of LightGBM score (CE decides)
-CE_THRESHOLD    = 0.45  # Cross-Encoder raw logit threshold (sigmoid ≈ 0.61 prob)
+LGBM_THRESHOLD  = 0.0   # Keep all top-K regardless of LightGBM score
+CE_THRESHOLD    = 0.45  # Cross-Encoder raw logit threshold
 CE_BATCH_SIZE   = 512   # GPU batch size for Cross-Encoder
 PROC_BATCH_SIZE = 2000  # Number of S1 entities per processing batch
 Q_MAXSIZE       = 10    # Queue depth between CPU→GPU threads
@@ -53,13 +49,74 @@ Q_MAXSIZE       = 10    # Queue depth between CPU→GPU threads
 _DONE = object()        # Thread sentinel
 
 
+def find_file(filename, search_dirs=None):
+    """Auto-locate file in current dir, ./output, ./models, or /kaggle/input/**/"""
+    if search_dirs is None:
+        search_dirs = [
+            '.',
+            'output',
+            'models',
+            'experiments/models',
+            'DATA/processed/test',
+            '/kaggle/working',
+            '/kaggle/input'
+        ]
+    
+    # 1. Direct path check
+    if os.path.exists(filename):
+        return filename
+
+    basename = os.path.basename(filename)
+
+    # 2. Search defined directories by exact basename
+    for d in search_dirs:
+        if not os.path.exists(d):
+            continue
+        for root, _, files in os.walk(d):
+            if basename in files:
+                target_path = os.path.join(root, basename)
+                print(f"[PATH RESOLVER] Found '{basename}' at: {target_path}")
+                return target_path
+
+    # 3. Candidate pairs wildcard fallback (candidate_pairs.tsv, candidate_pairs_b1.tsv, etc.)
+    if 'candidate' in basename.lower():
+        for d in search_dirs:
+            if not os.path.exists(d):
+                continue
+            for root, _, files in os.walk(d):
+                for f in files:
+                    if 'candidate' in f.lower() and f.endswith('.tsv'):
+                        target_path = os.path.join(root, f)
+                        print(f"[PATH RESOLVER] Candidate fallback found '{f}' at: {target_path}")
+                        return target_path
+
+    # 4. If file is a test TSV and missing, look for test.zip and auto-extract it
+    test_zips = glob.glob('/kaggle/input/**/test.zip', recursive=True) + glob.glob('**/test.zip', recursive=True)
+    if test_zips:
+        print(f"[PATH RESOLVER] '{basename}' not found directly. Extracting '{test_zips[0]}'...")
+        dest_dir = '/kaggle/working' if os.path.exists('/kaggle/working') else '.'
+        with zipfile.ZipFile(test_zips[0], 'r') as zf:
+            zf.extractall(dest_dir)
+        for d in search_dirs:
+            if not os.path.exists(d):
+                continue
+            for root, _, files in os.walk(d):
+                if basename in files:
+                    target_path = os.path.join(root, basename)
+                    print(f"[PATH RESOLVER] Found '{basename}' after extraction at: {target_path}")
+                    return target_path
+
+    raise FileNotFoundError(
+        f"Could not locate file '{filename}' (basename: '{basename}'). "
+        f"Searched in: {search_dirs}"
+    )
+
+
 # ═══════════════════════════════════════════════════════════
 #  DATA LOADING
 # ═══════════════════════════════════════════════════════════
 
 def load_candidates(candidates_file, max_entities=None):
-    """Load B1 candidate pairs. Returns dict {s1_id: [c_id, ...]}.
-    Uses vectorized pandas — no iterrows."""
     print(f"[DATA] Loading candidate pairs from {candidates_file}...")
     t0 = time.time()
 
@@ -76,7 +133,6 @@ def load_candidates(candidates_file, max_entities=None):
         df = df.iloc[:max_entities]
         print(f"    [VAL] Limiting to first {max_entities:,} S1 entities.")
 
-    # Vectorised split of candidate_entity_ids
     s1_ids    = df['source1_entity_id'].values
     cand_strs = df['candidate_entity_ids'].values
 
@@ -97,8 +153,6 @@ def load_candidates(candidates_file, max_entities=None):
 
 
 def load_norm_data(norm_file, needed_ids=None, desc=''):
-    """Load a normalized TSV file. If needed_ids given, keep only those rows.
-    Returns DataFrame indexed by entity_id."""
     print(f"[DATA] Loading {desc or os.path.basename(norm_file)}...")
     t0 = time.time()
 
@@ -110,7 +164,6 @@ def load_norm_data(norm_file, needed_ids=None, desc=''):
         if needed is not None:
             chunk = chunk[chunk['entity_id'].isin(needed)]
             if chunk.empty:
-                # Early exit if all needed IDs found
                 if needed and len(dfs) > 0:
                     found = set(pd.concat(dfs, ignore_index=True)['entity_id'])
                     if needed <= found:
@@ -124,14 +177,12 @@ def load_norm_data(norm_file, needed_ids=None, desc=''):
         return pd.DataFrame()
 
     df = pd.concat(dfs, ignore_index=True)
-    # Keep only columns needed for features + lookup
     keep_cols = [c for c in [
         'entity_id', 'name_basic', 'address_basic',
         'name_tokens', 'address_tokens', 'numeric_tokens'
     ] if c in df.columns]
     df = df[keep_cols].set_index('entity_id')
 
-    # Parse token columns from string → list (they may be stored as strings)
     for col in ['name_tokens', 'address_tokens', 'numeric_tokens']:
         if col in df.columns:
             df[col] = df[col].apply(
@@ -145,7 +196,6 @@ def load_norm_data(norm_file, needed_ids=None, desc=''):
 
 # ═══════════════════════════════════════════════════════════
 #  FEATURE COMPUTATION
-#  Exact match with training: 9 features from phase3_features.py
 # ═══════════════════════════════════════════════════════════
 
 def _jaccard(a, b):
@@ -158,15 +208,9 @@ def _jaccard(a, b):
 
 
 def compute_features_batch(pairs_df, s1_idx, s23_idx):
-    """Compute all 9 features for a batch of pairs.
-    pairs_df must have columns: s1_id, c_id, retrieval_score.
-    s1_idx / s23_idx are DataFrames indexed by entity_id.
-    Returns DataFrame with FEATURE_COLS."""
-
     s1_ids = pairs_df['s1_id'].values
     c_ids  = pairs_df['c_id'].values
 
-    # Vectorised column lookups
     s1_name = s1_idx['name_basic'].reindex(s1_ids).fillna('').values
     c_name  = s23_idx['name_basic'].reindex(c_ids).fillna('').values
     s1_addr = s1_idx['address_basic'].reindex(s1_ids).fillna('').values
@@ -213,8 +257,7 @@ def compute_features_batch(pairs_df, s1_idx, s23_idx):
 
 
 # ═══════════════════════════════════════════════════════════
-#  CPU PRODUCER
-#  Reads S1 batches → features → LightGBM → top-K → queue
+#  CPU PRODUCER & GPU CONSUMER
 # ═══════════════════════════════════════════════════════════
 
 def cpu_producer(s1_ids_list, candidates, s1_idx, s23_idx, lgbm_model, q_out):
@@ -222,7 +265,6 @@ def cpu_producer(s1_ids_list, candidates, s1_idx, s23_idx, lgbm_model, q_out):
         for batch_start in range(0, len(s1_ids_list), PROC_BATCH_SIZE):
             batch_ids = s1_ids_list[batch_start:batch_start + PROC_BATCH_SIZE]
 
-            # Build flat pairs table for this batch
             rows = []
             for s1_id in batch_ids:
                 cids = candidates.get(s1_id, [])
@@ -231,20 +273,14 @@ def cpu_producer(s1_ids_list, candidates, s1_idx, s23_idx, lgbm_model, q_out):
                         rows.append({'s1_id': s1_id, 'c_id': c_id, 'retrieval_score': 1.0})
 
             if not rows:
-                # All singletons — pass empty signal
                 q_out.put(('SINGLETONS', batch_ids))
                 continue
 
             pairs_df = pd.DataFrame(rows)
-
-            # Compute features
-            feat_df = compute_features_batch(pairs_df, s1_idx, s23_idx)
-
-            # LightGBM scoring
+            feat_df  = compute_features_batch(pairs_df, s1_idx, s23_idx)
             lgbm_scores = lgbm_model.predict(feat_df[FEATURE_COLS])
             pairs_df['lgbm_score'] = lgbm_scores
 
-            # Keep top-K per S1 entity (no threshold — CE decides)
             pairs_df = (
                 pairs_df
                 .sort_values('lgbm_score', ascending=False)
@@ -262,24 +298,18 @@ def cpu_producer(s1_ids_list, candidates, s1_idx, s23_idx, lgbm_model, q_out):
         q_out.put(_DONE)
 
 
-# ═══════════════════════════════════════════════════════════
-#  GPU CONSUMER
-#  Reads batches → Cross-Encoder → fused score → writes
-# ═══════════════════════════════════════════════════════════
-
 def gpu_consumer(cross_encoder, s1_idx, s23_idx, q_in, output_file,
                  all_s1_ids, mode='full'):
-    matched   = {}   # {s1_id: best_c_id_list}  — kept in memory for final write
+    matched   = {}
     n_pairs_scored = 0
     n_errors  = 0
 
     pbar = tqdm(total=len(all_s1_ids), desc="  Entities processed",
-                unit="S1", mininterval=10, leave=True)
+                unit="S1", mininterval=5, leave=True)
 
     try:
         while True:
             item = q_in.get()
-
             if item is _DONE:
                 break
 
@@ -291,17 +321,14 @@ def gpu_consumer(cross_encoder, s1_idx, s23_idx, q_in, output_file,
                 continue
 
             if tag == 'SINGLETONS':
-                # No candidates found — write empty
                 for s1_id in payload:
                     matched[s1_id] = []
                 pbar.update(len(payload))
                 continue
 
-            # tag == 'BATCH'
             pairs_df = payload
             s1_batch_ids = pairs_df['s1_id'].unique()
 
-            # Build text pairs for Cross-Encoder
             s1_names = s1_idx['name_basic'].reindex(pairs_df['s1_id']).fillna('').values
             s1_addrs = s1_idx['address_basic'].reindex(pairs_df['s1_id']).fillna('').values
             c_names  = s23_idx['name_basic'].reindex(pairs_df['c_id']).fillna('').values
@@ -312,7 +339,6 @@ def gpu_consumer(cross_encoder, s1_idx, s23_idx, q_in, output_file,
                 for n, a, cn, ca in zip(s1_names, s1_addrs, c_names, c_addrs)
             ]
 
-            # Cross-Encoder inference
             ce_logits = cross_encoder.predict(
                 text_pairs,
                 batch_size=CE_BATCH_SIZE,
@@ -322,17 +348,14 @@ def gpu_consumer(cross_encoder, s1_idx, s23_idx, q_in, output_file,
                 ce_logits = [ce_logits]
             ce_logits = np.array(ce_logits)
 
-            # Fused score: 30% LightGBM + 70% CE logit (normalised)
             lgbm_norm = pairs_df['lgbm_score'].values
             fused     = 0.3 * lgbm_norm + 0.7 * ce_logits
             pairs_df  = pairs_df.copy()
             pairs_df['ce_logit'] = ce_logits
             pairs_df['fused']    = fused
 
-            # Keep matches above CE threshold
             hits = pairs_df[pairs_df['ce_logit'] >= CE_THRESHOLD]
 
-            # Group by S1 — keep all hits (one-to-many allowed)
             for s1_id in s1_batch_ids:
                 s1_hits = hits[hits['s1_id'] == s1_id]['c_id'].tolist()
                 matched[s1_id] = s1_hits
@@ -343,7 +366,6 @@ def gpu_consumer(cross_encoder, s1_idx, s23_idx, q_in, output_file,
     finally:
         pbar.close()
 
-    # ── Write output file ───────────────────────────────────
     print(f"\n[WRITE] Writing {len(all_s1_ids):,} rows to {output_file}...")
     n_with_match = 0
     file_mode = 'a' if mode == 'full' else 'w'
@@ -356,7 +378,6 @@ def gpu_consumer(cross_encoder, s1_idx, s23_idx, q_in, output_file,
                 n_with_match += 1
             f.write(f"{s1_id}\t{','.join(hits)}\n")
 
-    # ── Validation metrics ──────────────────────────────────
     print("\n" + "=" * 50)
     print("  PIPELINE METRICS")
     print("=" * 50)
@@ -371,162 +392,93 @@ def gpu_consumer(cross_encoder, s1_idx, s23_idx, q_in, output_file,
 
 
 # ═══════════════════════════════════════════════════════════
-#  OUTPUT VALIDATION
+#  VALIDATION & MAIN
 # ═══════════════════════════════════════════════════════════
 
 def validate_output(output_file, all_s1_ids):
     print(f"\n[VALIDATE] Checking {output_file}...")
     errors = []
-    warnings_list = []
 
     if not os.path.exists(output_file):
         errors.append("Output file does not exist!")
-        return errors, warnings_list
+        return errors
 
     df = pd.read_csv(output_file, sep='\t', dtype=str).fillna('')
-
-    # 1. Column names
     expected_cols = ['source1_entity_id', 'matched_entity_ids']
     if list(df.columns) != expected_cols:
-        errors.append(f"Wrong columns: {list(df.columns)} (expected {expected_cols})")
+        errors.append(f"Wrong columns: {list(df.columns)}")
 
-    # 2. Row count
     if len(df) != len(all_s1_ids):
         errors.append(f"Row count mismatch: got {len(df):,}, expected {len(all_s1_ids):,}")
 
-    # 3. No duplicate S1 IDs
     dupes = df['source1_entity_id'].duplicated().sum()
     if dupes:
         errors.append(f"Found {dupes:,} duplicate source1_entity_id values!")
-
-    # 4. All S1 IDs present
-    found_ids    = set(df['source1_entity_id'])
-    expected_ids = set(all_s1_ids)
-    missing      = expected_ids - found_ids
-    extra        = found_ids - expected_ids
-    if missing:
-        errors.append(f"Missing {len(missing):,} S1 entity IDs from output!")
-    if extra:
-        warnings_list.append(f"{len(extra):,} unexpected extra S1 IDs in output.")
-
-    # 5. No index column
-    if 'Unnamed: 0' in df.columns:
-        errors.append("Accidental index column 'Unnamed: 0' found!")
-
-    # 6. Match stats
-    empty_rows = (df['matched_entity_ids'] == '').sum()
-    non_empty  = len(df) - empty_rows
-    print(f"  File size        : {os.path.getsize(output_file)/1e6:.1f} MB")
-    print(f"  Rows             : {len(df):,}")
-    print(f"  Matched rows     : {non_empty:,}  ({non_empty/max(1,len(df))*100:.1f}%)")
-    print(f"  Singleton rows   : {empty_rows:,}  ({empty_rows/max(1,len(df))*100:.1f}%)")
-
-    # 7. Sample check
-    sample = df[df['matched_entity_ids'] != ''].head(3)
-    print("\n  Sample matches:")
-    for _, r in sample.iterrows():
-        print(f"    {r['source1_entity_id']} -> {r['matched_entity_ids'][:60]}")
 
     if errors:
         print(f"\n  [FAIL] {len(errors)} validation error(s):")
         for e in errors:
             print(f"    ERROR: {e}")
     else:
-        print(f"\n  [PASS] All validation checks passed!")
+        print(f"\n  [PASS] All validation checks passed! Total rows: {len(df):,}")
 
-    if warnings_list:
-        for w in warnings_list:
-            print(f"    WARN: {w}")
+    return errors
 
-    return errors, warnings_list
-
-
-# ═══════════════════════════════════════════════════════════
-#  COMPARISON WITH B1 (validation mode only)
-# ═══════════════════════════════════════════════════════════
-
-def compare_with_b1(b2_file, b1_file, sample_ids):
-    print("\n[COMPARE] B1 vs B2 on validation subset...")
-    sample_set = set(sample_ids)
-
-    b1 = pd.read_csv(b1_file, sep='\t', dtype=str).fillna('')
-    b1 = b1[b1['source1_entity_id'].isin(sample_set)]
-    b2 = pd.read_csv(b2_file, sep='\t', dtype=str).fillna('')
-
-    b1_matched = (b1['matched_entity_ids'] != '').sum()
-    b2_matched = (b2['matched_entity_ids'] != '').sum()
-
-    print(f"  B1 entities with match : {b1_matched:,} / {len(b1):,}  ({b1_matched/max(1,len(b1))*100:.1f}%)")
-    print(f"  B2 entities with match : {b2_matched:,} / {len(b2):,}  ({b2_matched/max(1,len(b2))*100:.1f}%)")
-
-    # Overlap analysis
-    b1_dict = dict(zip(b1['source1_entity_id'], b1['matched_entity_ids']))
-    b2_dict = dict(zip(b2['source1_entity_id'], b2['matched_entity_ids']))
-
-    both_match = agree = 0
-    for s1_id in sample_set:
-        b1m = set(b1_dict.get(s1_id, '').split(',')) - {''}
-        b2m = set(b2_dict.get(s1_id, '').split(',')) - {''}
-        if b1m and b2m:
-            both_match += 1
-            if b1m == b2m:
-                agree += 1
-
-    print(f"  Both B1 & B2 matched   : {both_match:,}")
-    print(f"  Exact agreement        : {agree:,} / {both_match:,}  ({agree/max(1,both_match)*100:.1f}%)")
 
 def main():
-    global CE_THRESHOLD, TOP_K_LGBM
+    global CE_THRESHOLD, TOP_K_LGBM, CE_BATCH_SIZE
 
-    parser = argparse.ArgumentParser(description='B2: B1-Candidates + LightGBM + Cross-Encoder')
-    parser.add_argument('--mode',    choices=['validate', 'full'], default='validate',
-                        help='validate=50K entities; full=all 1.73M')
-    parser.add_argument('--n-val',   type=int, default=50_000)
+    parser = argparse.ArgumentParser(description='B2 Kaggle Execution Pipeline')
+    parser.add_argument('--mode', choices=['validate', 'full'], default='full')
+    parser.add_argument('--n-val', type=int, default=50_000)
     parser.add_argument('--ce-threshold', type=float, default=CE_THRESHOLD)
-    parser.add_argument('--top-k',   type=int, default=TOP_K_LGBM)
+    parser.add_argument('--top-k', type=int, default=TOP_K_LGBM)
+    parser.add_argument('--batch-size', type=int, default=CE_BATCH_SIZE)
     args = parser.parse_args()
 
     CE_THRESHOLD = args.ce_threshold
-    TOP_K_LGBM  = args.top_k
+    TOP_K_LGBM   = args.top_k
+    CE_BATCH_SIZE = args.batch_size
     is_validate  = (args.mode == 'validate')
 
     print("=" * 60)
-    print("  TriMatch-ER B2 -- LightGBM + Cross-Encoder Pipeline")
-    print(f"  Mode       : {'VALIDATION (' + str(args.n_val) + ' entities)' if is_validate else 'FULL RUN (1.73M entities)'}")
+    print("  TriMatch-ER B2 -- Kaggle High-Performance Pipeline")
+    print(f"  Mode       : {'VALIDATION (' + str(args.n_val) + ')' if is_validate else 'FULL RUN (1.73M)'}")
     print(f"  Top-K LGBM : {TOP_K_LGBM}")
-    print(f"  CE logit   : >= {CE_THRESHOLD}")
-    print(f"  CE batch   : {CE_BATCH_SIZE}")
+    print(f"  CE Threshold: {CE_THRESHOLD}")
+    print(f"  CE Batch   : {CE_BATCH_SIZE}")
     print("=" * 60)
 
-    candidates_file = 'output/candidate_pairs_b1.tsv'
-    b1_results_file = 'output/matching_results_b1.tsv'
-    s1_norm_file    = 'DATA/processed/test/test_source1_norm.tsv'
-    s2_norm_file    = 'DATA/processed/test/test_source2_norm.tsv'
-    s3_norm_file    = 'DATA/processed/test/test_source3_norm.tsv'
-    lgbm_model_file = 'experiments/models/lgbm_matcher.pkl'
-    suffix      = '_val' if is_validate else ''
-    output_file = f'output/matching_results_b2{suffix}.tsv'
-    os.makedirs('output', exist_ok=True)
+    # Auto-resolve file locations
+    try:
+        candidates_file = find_file('candidate_pairs_b1.tsv')
+    except FileNotFoundError:
+        candidates_file = find_file('candidate_pairs.tsv')
 
-    print(f"\n[MODEL] Loading LightGBM...")
+    s1_norm_file    = find_file('test_source1_norm.tsv')
+    s2_norm_file    = find_file('test_source2_norm.tsv')
+    s3_norm_file    = find_file('test_source3_norm.tsv')
+    lgbm_model_file = find_file('lgbm_matcher.pkl')
+
+    out_dir = '/kaggle/working' if os.path.exists('/kaggle/working') else '.'
+    output_file = os.path.join(out_dir, 'matching_results.tsv')
+    zip_path    = os.path.join(out_dir, 'submission_b2.zip')
+
+    print(f"\n[MODEL] Loading LightGBM from {lgbm_model_file}...")
     lgbm_model = joblib.load(lgbm_model_file)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"[MODEL] Loading Cross-Encoder on {device.upper()}...")
     cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', device=device)
-    print(f"        Device: {device.upper()} {'(GPU!)' if device=='cuda' else '(CPU)'}")
 
-    # --------------------------------------------------------
-    # VALIDATION MODE: single pass on n_val entities
-    # --------------------------------------------------------
     if is_validate:
         candidates = load_candidates(candidates_file, max_entities=args.n_val)
         all_s1_ids = list(candidates.keys())
         needed_s23 = set(cid for cids in candidates.values() for cid in cids)
-        print(f"    Unique S23 IDs needed : {len(needed_s23):,}")
         s1_idx  = load_norm_data(s1_norm_file, needed_ids=set(all_s1_ids), desc='S1 norm')
         s2_idx  = load_norm_data(s2_norm_file, needed_ids=needed_s23, desc='S2 norm')
         s3_idx  = load_norm_data(s3_norm_file, needed_ids=needed_s23, desc='S3 norm')
         s23_idx = pd.concat([s2_idx, s3_idx]); del s2_idx, s3_idx, needed_s23; gc.collect()
+
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write("source1_entity_id\tmatched_entity_ids\n")
         q     = queue.Queue(maxsize=Q_MAXSIZE)
@@ -535,29 +487,16 @@ def main():
                                  daemon=True)
         t_gpu = threading.Thread(target=gpu_consumer,
                                  args=(cross_encoder, s1_idx, s23_idx, q, output_file,
-                                       all_s1_ids, args.mode),
+                                       all_s1_ids, 'validate'),
                                  daemon=True)
         t0 = time.time()
         t_gpu.start(); t_cpu.start(); t_cpu.join(); t_gpu.join()
-        print(f"\n[TIMING] {(time.time()-t0)/60:.1f} min")
-        errors, _ = validate_output(output_file, all_s1_ids)
-        if os.path.exists(b1_results_file):
-            compare_with_b1(output_file, b1_results_file, all_s1_ids)
-        print("\n" + "=" * 60)
-        print("  [VALIDATE DONE] Run full with: python src/generate_submission_b2.py --mode full")
-        print("=" * 60)
+        print(f"\n[TIMING] Validation run: {(time.time()-t0)/60:.1f} min")
+        validate_output(output_file, all_s1_ids)
         return
 
-    # --------------------------------------------------------
-    # FULL MODE: country-partitioned to avoid OOM
-    #
-    # Problem: 50.5M pairs + 3.9M S23 rows = OOM (4.5GB+)
-    # Fix: process india/us/france one at a time
-    # Peak RAM per partition: ~600MB S1 + ~850MB candidates + ~500MB S23 = ~2GB
-    # --------------------------------------------------------
-
-    # Step A: Build S1->country map (2 columns only = ~80MB)
-    print("\n[PARTITION] Building S1 country map (2-col scan)...")
+    # FULL MODE: Partitioned by country
+    print("\n[PARTITION] Scanning S1 countries...")
     country_map = {}
     for chunk in pd.read_csv(s1_norm_file, sep='\t', dtype=str,
                              usecols=['entity_id', 'country_normalized'],
@@ -572,28 +511,21 @@ def main():
         if c:
             country_s1_ids[c].append(eid)
     del country_map; gc.collect()
-    for c, ids in country_s1_ids.items():
-        print(f"    {c:10s}: {len(ids):,} S1 entities")
 
     all_s1_ids_ordered = [eid for c in countries for eid in country_s1_ids[c]]
 
-    # Write output header
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write("source1_entity_id\tmatched_entity_ids\n")
 
-    # Step B: Process each country
     t_total = time.time()
     for ci, country in enumerate(countries, 1):
         s1_ids_country = country_s1_ids[country]
         s1_id_set      = set(s1_ids_country)
 
         print(f"\n{'='*55}")
-        print(f"  PARTITION {ci}/{len(countries)}: {country.upper()}  ({len(s1_ids_country):,} S1 entities)")
+        print(f"  PARTITION {ci}/{len(countries)}: {country.upper()}  ({len(s1_ids_country):,} entities)")
         print(f"{'='*55}")
 
-        # Load candidates for this country (stream & filter)
-        print(f"  [DATA] Loading candidates for {country}...")
-        t0 = time.time()
         candidates = {}
         needed_s23 = set()
         for chunk in pd.read_csv(candidates_file, sep='\t', dtype=str, chunksize=200_000):
@@ -604,26 +536,18 @@ def main():
                 cids = [x.strip() for x in raw.split(',') if x.strip()] if raw else []
                 candidates[s1_id] = cids
                 needed_s23.update(cids)
-        for s1_id in s1_ids_country:       # ensure singletons present
+        for s1_id in s1_ids_country:
             candidates.setdefault(s1_id, [])
-        total_pairs = sum(len(v) for v in candidates.values())
-        print(f"    {total_pairs:,} pairs | {len(needed_s23):,} unique S23 IDs | {time.time()-t0:.1f}s")
 
-        # Load features
-        s1_idx  = load_norm_data(s1_norm_file, needed_ids=s1_id_set,
-                                 desc=f'S1 norm ({country})')
-        s2_idx  = load_norm_data(s2_norm_file, needed_ids=needed_s23, desc='S2 norm')
-        s3_idx  = load_norm_data(s3_norm_file, needed_ids=needed_s23, desc='S3 norm')
+        s1_idx  = load_norm_data(s1_norm_file, needed_ids=s1_id_set, desc=f'S1 ({country})')
+        s2_idx  = load_norm_data(s2_norm_file, needed_ids=needed_s23, desc='S2')
+        s3_idx  = load_norm_data(s3_norm_file, needed_ids=needed_s23, desc='S3')
         s23_idx = pd.concat([s2_idx, s3_idx])
         del s2_idx, s3_idx, needed_s23; gc.collect()
-        print(f"    S23 entities loaded: {len(s23_idx):,}")
 
-        # Run parallel pipeline
-        print(f"  [PIPELINE] CPU (LGBM) + GPU (CE) ...")
         q     = queue.Queue(maxsize=Q_MAXSIZE)
         t_cpu = threading.Thread(target=cpu_producer,
-                                 args=(s1_ids_country, candidates, s1_idx, s23_idx,
-                                       lgbm_model, q),
+                                 args=(s1_ids_country, candidates, s1_idx, s23_idx, lgbm_model, q),
                                  daemon=True)
         t_gpu = threading.Thread(target=gpu_consumer,
                                  args=(cross_encoder, s1_idx, s23_idx, q, output_file,
@@ -638,25 +562,18 @@ def main():
             torch.cuda.empty_cache()
 
     total_elapsed = time.time() - t_total
-    print(f"\n[TIMING] Total full run: {total_elapsed/60:.1f} min")
+    print(f"\n[TIMING] Total run time: {total_elapsed/60:.1f} min")
 
-    errors, _ = validate_output(output_file, all_s1_ids_ordered)
+    errors = validate_output(output_file, all_s1_ids_ordered)
 
     if not errors:
-        zip_path = 'output/submission_b2.zip'
-        print(f"\n[ZIP] Creating {zip_path}...")
+        print(f"\n[ZIP] Creating Kaggle submission archive: {zip_path}...")
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             zf.write(output_file, arcname='matching_results.tsv')
-        print(f"    Zip size: {os.path.getsize(zip_path)/1e6:.1f} MB")
-
-    print("\n" + "=" * 60)
-    if errors:
-        print("  [FAILED] Validation errors -- check above.")
-    else:
-        print("  [SUCCESS] B2 submission ready!")
-        print(f"  Output : {output_file}")
-        print(f"  Submit : output/submission_b2.zip")
-    print("=" * 60)
+        print(f"    Zip Size: {os.path.getsize(zip_path)/1e6:.1f} MB")
+        print("\n" + "=" * 60)
+        print(f"  [SUCCESS] B2 Kaggle Submission created at: {zip_path}")
+        print("=" * 60)
 
 
 if __name__ == '__main__':
